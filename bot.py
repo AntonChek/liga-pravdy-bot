@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -44,6 +45,10 @@ SITUATIONS = load_json(SITUATIONS_FILE)
 WITNESSES = load_json(WITNESSES_FILE)
 CONCLUSIONS = load_json(CONCLUSIONS_FILE)
 
+# --- Константы для очистки ---
+GAME_TIMEOUT = 3600  # 1 час в секундах
+CLEANUP_INTERVAL = 300  # 5 минут в секундах
+
 # --- Хранилище состояний игр в разных чатах (in-memory) ---
 # Структура для каждого chat_id:
 # {
@@ -57,6 +62,7 @@ CONCLUSIONS = load_json(CONCLUSIONS_FILE)
 #   "judge_id": user_id,
 #   "defendant_id": user_id,
 #   "witness_map": {user_id: witness_text},
+#   "last_activity": timestamp,  # время последней активности
 # }
 GAMES: Dict[int, Dict] = {}
 GAMES_LOCK = asyncio.Lock()
@@ -77,6 +83,44 @@ def pick_random_and_mark(collection: List, used: set):
 def get_mention(user: types.User):
     name = user.full_name
     return f"<a href='tg://user?id={user.id}'>{name}</a>"
+
+# --- Функции очистки ---
+async def cleanup_old_games():
+    """Очищает игры, которые неактивны более GAME_TIMEOUT секунд"""
+    current_time = time.time()
+    removed_games = []
+    
+    async with GAMES_LOCK:
+        games_to_remove = []
+        for chat_id, game in GAMES.items():
+            last_activity = game.get('last_activity', current_time)
+            if current_time - last_activity > GAME_TIMEOUT:
+                games_to_remove.append(chat_id)
+                removed_games.append(chat_id)
+        
+        for chat_id in games_to_remove:
+            del GAMES[chat_id]
+    
+    if removed_games:
+        logger.info(f"Очищено {len(removed_games)} неактивных игр: {removed_games}")
+    
+    return len(removed_games)
+
+async def cleanup_task():
+    """Периодическая задача очистки неиспользуемых игр"""
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL)
+            removed_count = await cleanup_old_games()
+            if removed_count > 0:
+                logger.info(f"Автоматическая очистка: удалено {removed_count} игр")
+        except Exception as e:
+            logger.error(f"Ошибка при очистке игр: {e}")
+
+def update_game_activity(chat_id: int):
+    """Обновляет время последней активности игры"""
+    if chat_id in GAMES:
+        GAMES[chat_id]['last_activity'] = time.time()
 
 # --- Keyboards ---
 def start_game_kb():
@@ -129,7 +173,11 @@ async def cmd_start(message: Message):
     await message.reply(
         "Привет! Я бот для ролевой игры 'Суд'.\n\n"
         "Запусти /newgame в групповом чате, чтобы начать новую игру.\n"
-        "Игроки будут присоединяться через кнопку 'Присоединиться'.",
+        "Игроки будут присоединяться через кнопку 'Присоединиться'.\n\n"
+        "Команды:\n"
+        "/newgame - создать новую игру\n"
+        "/status - показать статус игры\n"
+        "/cleanup - очистить неактивные игры (только для админов)",
     )
 
 @dp.message(Command("newgame"))
@@ -151,6 +199,7 @@ async def cmd_newgame(message: Message):
             "judge_id": None,
             "defendant_id": None,
             "witness_map": {},
+            "last_activity": time.time(),
         }
 
     await message.reply(
@@ -177,6 +226,7 @@ async def cb_join(callback_query: CallbackQuery):
 
         game["players"][user.id] = {"name": user.full_name, "role": None}
         game["order"].append(user.id)
+        game["last_activity"] = time.time()
 
     await bot.answer_callback_query(callback_query.id, "Вы присоединились к игре.")
     await bot.send_message(chat_id, f"{get_mention(user)} присоединился к игре.", parse_mode=ParseMode.HTML)
@@ -200,6 +250,7 @@ async def cb_stop_join(callback_query: CallbackQuery):
     # show list and control keyboard
     async with GAMES_LOCK:
         game = GAMES[chat_id]
+        game["last_activity"] = time.time()
         names = [p["name"] for p in game["players"].values()]
     txt = "Набор окончен. Игроки:\n" + "\n".join(f"- {n}" for n in names)
     await bot.answer_callback_query(callback_query.id, "Набор окончен. Можете раздать роли.")
@@ -237,6 +288,7 @@ async def cb_assign_roles(callback_query: CallbackQuery):
         game["judge_id"] = judge_id
         game["defendant_id"] = defendant_id
         game["roles_assigned"] = True
+        game["last_activity"] = time.time()
 
     # Отправить приватные сообщения с ролью каждому игроку
     for uid, pdata in game["players"].items():
@@ -272,6 +324,7 @@ async def cb_start_round(callback_query: CallbackQuery):
 
         game["current_situation"] = situation
         game["stage"] = "situation"
+        game["last_activity"] = time.time()
         # очистим карты свидетелей на новый раунд
         game["witness_map"] = {}
 
@@ -317,6 +370,7 @@ async def cb_draw_witness(callback_query: CallbackQuery):
             return
 
         game["witness_map"][user.id] = witness
+        game["last_activity"] = time.time()
 
     # отправить приватно текст свидетелю
     try:
@@ -337,6 +391,7 @@ async def cb_start_debate(callback_query: CallbackQuery):
             await bot.answer_callback_query(callback_query.id, "Нет активного раунда.")
             return
         game["stage"] = "debate"
+        game["last_activity"] = time.time()
     await bot.answer_callback_query(callback_query.id, "Стадия дебатов началась.")
     await bot.send_message(chat_id, "Начинаются дебаты: прокурор и адвокат представляют свои аргументы. Судья может объявить перерыв или перейти к вердикту.", reply_markup=debate_kb())
 
@@ -359,6 +414,7 @@ async def cb_judge_verdict(callback_query: CallbackQuery):
             return
 
         game["stage"] = "verdict"
+        game["last_activity"] = time.time()
         # случайный вывод из conclusions (если есть)
         conclusion = pick_random_and_mark(CONCLUSIONS, set()) if CONCLUSIONS else None
 
@@ -425,6 +481,24 @@ async def cmd_status(message: Message):
         lines = [f"{pdata['name']} — {pdata.get('role','(не назначена)')}" for uid,pdata in players.items()]
         await message.reply("Текущие игроки:\n" + "\n".join(lines))
 
+# --- Команда для очистки неактивных игр (только для админов) ---
+@dp.message(Command("cleanup"))
+async def cmd_cleanup(message: Message):
+    # Проверяем, что команда отправлена в приватном чате или от админа
+    if message.chat.type != ChatType.PRIVATE:
+        # В групповом чате проверяем права админа
+        try:
+            chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+            if chat_member.status not in ['creator', 'administrator']:
+                await message.reply("Только администраторы могут использовать эту команду.")
+                return
+        except:
+            await message.reply("Не удалось проверить права администратора.")
+            return
+    
+    removed_count = await cleanup_old_games()
+    await message.reply(f"Очистка завершена. Удалено {removed_count} неактивных игр.")
+
 # --- Обработка ошибок (логирование) ---
 @dp.error()
 async def handle_errors(event, exception):
@@ -432,7 +506,19 @@ async def handle_errors(event, exception):
     return True
 
 async def main():
-    await dp.start_polling(bot)
+    # Запускаем задачу очистки в фоне
+    cleanup_task_handle = asyncio.create_task(cleanup_task())
+    
+    try:
+        logger.info("Запуск бота с автоматической очисткой неактивных игр...")
+        await dp.start_polling(bot)
+    finally:
+        # Останавливаем задачу очистки при завершении
+        cleanup_task_handle.cancel()
+        try:
+            await cleanup_task_handle
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
