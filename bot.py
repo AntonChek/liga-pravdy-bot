@@ -9,6 +9,7 @@ from config import TOKEN
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -525,6 +526,18 @@ async def handle_errors(event, exception):
     return True
 
 async def main():
+    # Запускаем health check сервер в фоне (для Render)
+    health_server_thread = None
+    if os.environ.get('RENDER'):
+        try:
+            import threading
+            from health_check import start_health_server
+            health_server_thread = threading.Thread(target=start_health_server, daemon=True)
+            health_server_thread.start()
+            logger.info("Health check server started for Render")
+        except Exception as e:
+            logger.warning(f"Failed to start health check server: {e}")
+    
     # Запускаем задачу очистки в фоне
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     
