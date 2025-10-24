@@ -27,6 +27,11 @@ import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Проверяем наличие токена
+if not config.TOKEN:
+    logger.error("Токен бота не найден! Создайте файл .env с BOT_TOKEN=your_token_here")
+    exit(1)
+
 bot = Bot(token=config.TOKEN)
 dp = Dispatcher()
 
@@ -291,11 +296,17 @@ async def cb_assign_roles(callback_query: CallbackQuery):
         game["last_activity"] = time.time()
 
     # Отправить приватные сообщения с ролью каждому игроку
+    failed_users = []
     for uid, pdata in game["players"].items():
         try:
             await bot.send_message(uid, f"Вам назначена роль: {pdata['role']}", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             logger.warning(f"Не удалось отправить приватное сообщение {uid}: {e}")
+            failed_users.append(pdata['name'])
+    
+    # Если не удалось отправить некоторым пользователям, сообщим об этом
+    if failed_users:
+        await bot.send_message(chat_id, f"Не удалось отправить роли в ЛС следующим пользователям: {', '.join(failed_users)}. Они могут узнать свою роль через команду /status.")
 
     # Объявление в чате
     lines = []
@@ -339,13 +350,21 @@ async def cb_instructions(callback_query: CallbackQuery):
     chat_id = callback_query.message.chat.id
     
     try:
-        # Отправка PDF файла
+        # Проверяем существование файла
+        from pathlib import Path
+        instructions_path = Path("./instructions.jpg")
+        
+        if not instructions_path.exists():
+            await bot.answer_callback_query(callback_query.id, "Файл инструкции не найден.")
+            return
+            
+        # Отправка файла
         from aiogram.types import FSInputFile
-        pdf_file = FSInputFile("./instructions.jpg")
+        pdf_file = FSInputFile(instructions_path)
         await bot.send_photo(chat_id=chat_id, photo=pdf_file, caption="Инструкция по игре")
         await bot.answer_callback_query(callback_query.id, "Инструкция отправлена.")
     except Exception as e:
-        logger.error(f"Ошибка при отправке PDF: {e}")
+        logger.error(f"Ошибка при отправке инструкции: {e}")
         await bot.answer_callback_query(callback_query.id, "Ошибка при отправке файла.")
 
 @dp.callback_query(lambda c: c.data == "draw_witness")
@@ -375,12 +394,12 @@ async def cb_draw_witness(callback_query: CallbackQuery):
     # отправить приватно текст свидетелю
     try:
         await bot.send_message(user.id, f"Ваша кураторская карта свидетеля:\n\n<b>{witness.title}</b>\n\n{witness.text}", parse_mode=ParseMode.HTML)
+        await bot.answer_callback_query(callback_query.id, "Карта отправлена вам в личные сообщения.")
     except Exception as e:
         logger.warning(f"Не удалось отправить свидетелю приватную карту {user.id}: {e}")
         # если нельзя писать приватно, отправим в чат с упоминанием (без раскрытия всей карты)
         await bot.send_message(chat_id, f"{get_mention(user)} вытянул(а) карту свидетеля (карта отправлена в ЛС или недоступна).", parse_mode=ParseMode.HTML)
-
-    await bot.answer_callback_query(callback_query.id, "Карта отправлена вам в личные сообщения (если это возможно).")
+        await bot.answer_callback_query(callback_query.id, "Карта отправлена в чат (ЛС недоступны).")
 
 @dp.callback_query(lambda c: c.data == "start_debate")
 async def cb_start_debate(callback_query: CallbackQuery):
@@ -512,6 +531,9 @@ async def main():
     try:
         logger.info("Запуск бота с автоматической очисткой неактивных игр...")
         await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске бота: {e}")
+        raise
     finally:
         # Останавливаем задачу очистки при завершении
         cleanup_task_handle.cancel()
@@ -519,6 +541,7 @@ async def main():
             await cleanup_task_handle
         except asyncio.CancelledError:
             pass
+        logger.info("Бот остановлен.")
 
 if __name__ == "__main__":
     asyncio.run(main())
