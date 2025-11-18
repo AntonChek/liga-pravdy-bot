@@ -1,9 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health  # Добавить health check endpoint
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -11,3 +12,7 @@ services:
         value: 3
       - key: DATA_DIR
         value: .
+      - key: RENDER
+        value: "true"  # Добавить для запуска health check сервера
+      - key: PORT
+        value: 8000  # Порт для health check
