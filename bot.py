@@ -541,12 +541,46 @@ async def main():
     # Запускаем задачу очистки в фоне
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     
+    # Механизм автоматического перезапуска при конфликтах
+    max_retries = 10
+    retry_delay = 30  # секунд
+    
     try:
-        logger.info("Запуск бота с автоматической очисткой неактивных игр...")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Критическая ошибка при запуске бота: {e}")
-        raise
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Запуск бота (попытка {attempt + 1}/{max_retries})...")
+                # drop_pending_updates=True очищает старые обновления и помогает избежать конфликтов
+                await dp.start_polling(
+                    bot, 
+                    drop_pending_updates=True,
+                    allowed_updates=["message", "callback_query"]
+                )
+            except KeyboardInterrupt:
+                logger.info("Бот остановлен пользователем")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                # Специальная обработка конфликтов Telegram
+                if "Conflict" in error_msg or "getUpdates" in error_msg:
+                    logger.error(f"Обнаружен конфликт с другим экземпляром бота (попытка {attempt + 1}/{max_retries}): {e}")
+                    logger.warning("Убедитесь, что запущен только один экземпляр бота на Render!")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Ожидание {retry_delay} секунд перед повторной попыткой...")
+                        await asyncio.sleep(retry_delay)
+                        # Увеличиваем задержку с каждой попыткой
+                        retry_delay = min(retry_delay * 1.5, 300)  # максимум 5 минут
+                    else:
+                        logger.error("Достигнуто максимальное количество попыток. Проверьте, что на Render запущен только один сервис!")
+                        raise
+                else:
+                    logger.error(f"Критическая ошибка при запуске бота (попытка {attempt + 1}/{max_retries}): {e}", exc_info=True)
+                    if attempt < max_retries - 1:
+                        logger.info(f"Перезапуск через {retry_delay} секунд...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 1.5, 300)
+                    else:
+                        logger.error("Достигнуто максимальное количество попыток перезапуска")
+                        raise
     finally:
         # Останавливаем задачу очистки при завершении
         cleanup_task_handle.cancel()
