@@ -1,12 +1,5 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
 import asyncio
-import random
-from config import TOKEN
-
-# main.py
-import asyncio
+import datetime
 import json
 import logging
 import os
@@ -16,9 +9,12 @@ from pathlib import Path
 from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
+    CallbackQuery,
 )
 from aiogram.enums import ChatType
 from aiogram.enums import ParseMode
@@ -117,11 +113,60 @@ async def cleanup_task():
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL)
-            removed_count = await cleanup_old_games()
-            if removed_count > 0:
-                logger.info(f"Автоматическая очистка: удалено {removed_count} игр")
+            try:
+                removed_count = await cleanup_old_games()
+                if removed_count > 0:
+                    logger.info(f"Автоматическая очистка: удалено {removed_count} игр")
+            except Exception as e:
+                logger.error(f"Ошибка при очистке игр: {e}", exc_info=True)
+                # Продолжаем работу даже при ошибке очистки
+        except asyncio.CancelledError:
+            logger.info("Задача очистки отменена")
+            break
         except Exception as e:
-            logger.error(f"Ошибка при очистке игр: {e}")
+            logger.critical(f"Критическая ошибка в cleanup_task: {e}", exc_info=True)
+            # Ждем перед следующей попыткой
+            await asyncio.sleep(60)
+
+async def heartbeat_task(start_time: datetime.datetime):
+    """Периодическая задача для поддержания активности бота"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Каждый час
+            # Проверяем, что бот все еще работает
+            try:
+                me = await bot.get_me()
+                uptime = datetime.datetime.now() - start_time
+                logger.info(f"Heartbeat: бот активен (@{me.username}), работает {uptime}")
+            except Exception as e:
+                logger.error(f"Heartbeat: ошибка при проверке состояния бота: {e}")
+                # Если не можем получить информацию о боте, значит соединение разорвано
+                # Это вызовет перезапуск polling в основном цикле
+                raise
+        except asyncio.CancelledError:
+            logger.info("Heartbeat задача отменена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в heartbeat_task: {e}", exc_info=True)
+            await asyncio.sleep(60)  # Ждем перед следующей попыткой
+
+async def connection_check_task():
+    """Периодически проверяет соединение с Telegram API"""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # Каждые 30 минут
+            try:
+                # Простая проверка - получаем информацию о боте
+                me = await bot.get_me()
+                logger.debug(f"Проверка соединения: бот активен (@{me.username})")
+            except Exception as e:
+                logger.warning(f"Проблема с соединением: {e}")
+                # Если соединение разорвано, это вызовет перезапуск в основном цикле
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в connection_check_task: {e}")
+            await asyncio.sleep(60)
 
 def update_game_activity(chat_id: int):
     """Обновляет время последней активности игры"""
@@ -217,50 +262,62 @@ async def cmd_newgame(message: Message):
 # --- Callbacks: join / stop_join / assign roles / start round / draw witness / etc. ---
 @dp.callback_query(lambda c: c.data == "join")
 async def cb_join(callback_query: CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    user = callback_query.from_user
+    try:
+        chat_id = callback_query.message.chat.id
+        user = callback_query.from_user
 
-    async with GAMES_LOCK:
-        game = GAMES.get(chat_id)
-        if not game:
-            await bot.answer_callback_query(callback_query.id, "Игра не найдена. Запустите /newgame.")
-            return
+        async with GAMES_LOCK:
+            game = GAMES.get(chat_id)
+            if not game:
+                await bot.answer_callback_query(callback_query.id, "Игра не найдена. Запустите /newgame.")
+                return
 
-        if user.id in game["players"]:
-            await bot.answer_callback_query(callback_query.id, "Вы уже в игре.")
-            return
+            if user.id in game["players"]:
+                await bot.answer_callback_query(callback_query.id, "Вы уже в игре.")
+                return
 
-        game["players"][user.id] = {"name": user.full_name, "role": None}
-        game["order"].append(user.id)
-        game["last_activity"] = time.time()
+            game["players"][user.id] = {"name": user.full_name, "role": None}
+            game["order"].append(user.id)
+            game["last_activity"] = time.time()
 
-    await bot.answer_callback_query(callback_query.id, "Вы присоединились к игре.")
-    await bot.send_message(chat_id, f"{get_mention(user)} присоединился к игре.", parse_mode=ParseMode.HTML)
+        await bot.answer_callback_query(callback_query.id, "Вы присоединились к игре.")
+        await bot.send_message(chat_id, f"{get_mention(user)} присоединился к игре.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Ошибка в cb_join: {e}", exc_info=True)
+        try:
+            await bot.answer_callback_query(callback_query.id, "Произошла ошибка. Попробуйте позже.")
+        except:
+            pass
 
 @dp.callback_query(lambda c: c.data == "stop_join")
 async def cb_stop_join(callback_query: CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    caller = callback_query.from_user
+    try:
+        chat_id = callback_query.message.chat.id
+        caller = callback_query.from_user
 
-    async with GAMES_LOCK:
-        game = GAMES.get(chat_id)
-        if not game:
-            await bot.answer_callback_query(callback_query.id, "Игра не найдена.")
-            return
+        async with GAMES_LOCK:
+            game = GAMES.get(chat_id)
+            if not game:
+                await bot.answer_callback_query(callback_query.id, "Игра не найдена.")
+                return
 
-        player_count = len(game["players"])
-    if player_count < config.MIN_PLAYERS:
-        await bot.answer_callback_query(callback_query.id, f"Слишком мало игроков ({player_count}). Нужны минимум {config.MIN_PLAYERS}.")
-        return
+            player_count = len(game["players"])
+            if player_count < config.MIN_PLAYERS:
+                await bot.answer_callback_query(callback_query.id, f"Слишком мало игроков ({player_count}). Нужны минимум {config.MIN_PLAYERS}.")
+                return
 
-    # show list and control keyboard
-    async with GAMES_LOCK:
-        game = GAMES[chat_id]
-        game["last_activity"] = time.time()
-        names = [p["name"] for p in game["players"].values()]
-    txt = "Набор окончен. Игроки:\n" + "\n".join(f"- {n}" for n in names)
-    await bot.answer_callback_query(callback_query.id, "Набор окончен. Можете раздать роли.")
-    await bot.send_message(chat_id, txt, reply_markup=game_control_kb())
+            game["last_activity"] = time.time()
+            names = [p["name"] for p in game["players"].values()]
+        
+        txt = "Набор окончен. Игроки:\n" + "\n".join(f"- {n}" for n in names)
+        await bot.answer_callback_query(callback_query.id, "Набор окончен. Можете раздать роли.")
+        await bot.send_message(chat_id, txt, reply_markup=game_control_kb())
+    except Exception as e:
+        logger.error(f"Ошибка в cb_stop_join: {e}", exc_info=True)
+        try:
+            await bot.answer_callback_query(callback_query.id, "Произошла ошибка. Попробуйте позже.")
+        except:
+            pass
 
 @dp.callback_query(lambda c: c.data == "assign_roles")
 async def cb_assign_roles(callback_query: CallbackQuery):
@@ -394,7 +451,9 @@ async def cb_draw_witness(callback_query: CallbackQuery):
 
     # отправить приватно текст свидетелю
     try:
-        await bot.send_message(user.id, f"Ваша кураторская карта свидетеля:\n\n<b>{witness.title}</b>\n\n{witness.text}", parse_mode=ParseMode.HTML)
+        witness_title = witness.get("title", "Карта свидетеля")
+        witness_text = witness.get("text", "")
+        await bot.send_message(user.id, f"Ваша кураторская карта свидетеля:\n\n<b>{witness_title}</b>\n\n{witness_text}", parse_mode=ParseMode.HTML)
         await bot.answer_callback_query(callback_query.id, "Карта отправлена вам в личные сообщения.")
     except Exception as e:
         logger.warning(f"Не удалось отправить свидетелю приватную карту {user.id}: {e}")
@@ -521,11 +580,46 @@ async def cmd_cleanup(message: Message):
 
 # --- Обработка ошибок (логирование) ---
 @dp.error()
-async def handle_errors(event, exception):
-    logger.exception("Ошибка: %s", exception)
-    return True
+async def handle_errors(update: types.Update, exception: Exception):
+    """Глобальный обработчик ошибок"""
+    try:
+        # Логируем ошибку
+        logger.error(f"Ошибка при обработке обновления {update}: {exception}", exc_info=True)
+        
+        # Обрабатываем специфичные ошибки Telegram
+        if isinstance(exception, Exception):
+            error_str = str(exception)
+            
+            # FloodWait - слишком много запросов
+            if "FloodWait" in error_str or "429" in error_str:
+                logger.warning(f"FloodWait обнаружен: {exception}")
+                return True  # Игнорируем, Telegram сам обработает
+            
+            # ChatNotFound - чат не найден
+            if "ChatNotFound" in error_str or "chat not found" in error_str.lower():
+                logger.warning(f"Чат не найден: {exception}")
+                return True
+            
+            # RetryAfter - нужно подождать
+            if "RetryAfter" in error_str:
+                logger.warning(f"RetryAfter: {exception}")
+                return True
+            
+            # Timeout - таймаут соединения
+            if "timeout" in error_str.lower() or "timed out" in error_str.lower():
+                logger.warning(f"Таймаут: {exception}")
+                return True
+        
+        # Для всех остальных ошибок возвращаем True, чтобы бот продолжал работать
+        return True
+    except Exception as e:
+        logger.critical(f"Критическая ошибка в обработчике ошибок: {e}")
+        return True
 
 async def main():
+    start_time = datetime.datetime.now()
+    logger.info(f"Бот запущен в {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     # Запускаем health check сервер в фоне (для Render)
     health_server_thread = None
     if os.environ.get('RENDER'):
@@ -541,19 +635,93 @@ async def main():
     # Запускаем задачу очистки в фоне
     cleanup_task_handle = asyncio.create_task(cleanup_task())
     
+    # Запускаем heartbeat задачу
+    heartbeat_task_handle = asyncio.create_task(heartbeat_task(start_time))
+    
+    # Запускаем задачу проверки соединения
+    connection_check_handle = asyncio.create_task(connection_check_task())
+    
+    # Бесконечный цикл перезапуска при ошибках
+    retry_delay = 30  # секунд
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     try:
-        logger.info("Запуск бота с автоматической очисткой неактивных игр...")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Критическая ошибка при запуске бота: {e}")
-        raise
+        while True:
+            try:
+                logger.info("Запуск бота...")
+                # drop_pending_updates=False - не сбрасываем при перезапуске после ошибок
+                # close_bot_session=False - не закрываем сессию при перезапуске
+                await dp.start_polling(
+                    bot, 
+                    drop_pending_updates=False,  # Не сбрасываем при перезапуске
+                    allowed_updates=["message", "callback_query"],
+                    close_bot_session=False,  # Важно для перезапуска
+                    polling_timeout=30,  # Таймаут для каждого запроса getUpdates
+                    request_timeout=30,   # Таймаут для HTTP запросов
+                )
+                # Если polling завершился без ошибки (например, KeyboardInterrupt)
+                break
+            except KeyboardInterrupt:
+                logger.info("Бот остановлен пользователем")
+                break
+            except Exception as e:
+                error_msg = str(e)
+                consecutive_errors += 1
+                
+                # Логируем ошибку
+                logger.error(f"Ошибка при работе бота (ошибка #{consecutive_errors}): {e}", exc_info=True)
+                
+                # Проверяем тип ошибки
+                is_critical = False
+                
+                # Специальная обработка различных типов ошибок
+                if "Conflict" in error_msg or "getUpdates" in error_msg:
+                    logger.warning("Обнаружен конфликт с другим экземпляром бота")
+                    is_critical = True
+                elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                    logger.warning("Таймаут соединения - это нормально при долгом простое")
+                    consecutive_errors = 0  # Таймауты не считаем критическими
+                elif "Connection" in error_msg or "network" in error_msg.lower():
+                    logger.warning("Проблема с сетью - переподключение...")
+                    consecutive_errors = 0  # Сетевые ошибки не критичны
+                elif consecutive_errors >= max_consecutive_errors:
+                    logger.critical(f"Слишком много последовательных ошибок ({consecutive_errors})")
+                    is_critical = True
+                
+                # Если критическая ошибка или слишком много ошибок подряд
+                if is_critical and consecutive_errors >= max_consecutive_errors:
+                    logger.error("Критическая ошибка - увеличенная задержка перед перезапуском")
+                    retry_delay = min(retry_delay * 2, 600)  # До 10 минут
+                else:
+                    # Для обычных ошибок используем стандартную задержку
+                    retry_delay = 30
+                
+                # Ждем перед перезапуском
+                logger.info(f"Перезапуск через {retry_delay} секунд...")
+                await asyncio.sleep(retry_delay)
+                
+                # Сбрасываем счетчик при успешном перезапуске
+                if consecutive_errors < max_consecutive_errors:
+                    consecutive_errors = 0
     finally:
-        # Останавливаем задачу очистки при завершении
+        # Останавливаем все задачи
         cleanup_task_handle.cancel()
+        heartbeat_task_handle.cancel()
+        connection_check_handle.cancel()
         try:
             await cleanup_task_handle
+            await heartbeat_task_handle
+            await connection_check_handle
         except asyncio.CancelledError:
             pass
+        
+        # Закрываем сессию бота
+        try:
+            await bot.session.close()
+        except:
+            pass
+        
         logger.info("Бот остановлен.")
 
 if __name__ == "__main__":
