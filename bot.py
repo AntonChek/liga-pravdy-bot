@@ -645,16 +645,17 @@ async def main():
     retry_delay = 30  # секунд
     consecutive_errors = 0
     max_consecutive_errors = 5
-    
+    is_first_start = True  # Флаг для первого запуска
+
     try:
         while True:
             try:
                 logger.info("Запуск бота...")
-                # drop_pending_updates=False - не сбрасываем при перезапуске после ошибок
+                # При первом запуске очищаем старые обновления, при перезапуске - не сбрасываем
                 # close_bot_session=False - не закрываем сессию при перезапуске
                 await dp.start_polling(
-                    bot, 
-                    drop_pending_updates=False,  # Не сбрасываем при перезапуске
+                    bot,
+                    drop_pending_updates=is_first_start,  # Очищаем только при первом запуске
                     allowed_updates=["message", "callback_query"],
                     close_bot_session=False,  # Важно для перезапуска
                     polling_timeout=30,  # Таймаут для каждого запроса getUpdates
@@ -668,7 +669,8 @@ async def main():
             except Exception as e:
                 error_msg = str(e)
                 consecutive_errors += 1
-                
+                is_first_start = False  # После первой ошибки это уже не первый запуск
+
                 # Логируем ошибку
                 logger.error(f"Ошибка при работе бота (ошибка #{consecutive_errors}): {e}", exc_info=True)
                 
@@ -678,6 +680,7 @@ async def main():
                 # Специальная обработка различных типов ошибок
                 if "Conflict" in error_msg or "getUpdates" in error_msg:
                     logger.warning("Обнаружен конфликт с другим экземпляром бота")
+                    logger.warning("Убедитесь, что запущен только один экземпляр бота на Render!")
                     is_critical = True
                 elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
                     logger.warning("Таймаут соединения - это нормально при долгом простое")
