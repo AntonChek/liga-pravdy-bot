@@ -620,15 +620,16 @@ async def main():
     start_time = datetime.datetime.now()
     logger.info(f"Бот запущен в {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Запускаем health check сервер в фоне (для Render)
+    # Запускаем health check сервер в фоне (для Render и Railway)
     health_server_thread = None
-    if os.environ.get('RENDER'):
+    if os.environ.get('RENDER') or os.environ.get('PORT'):
         try:
             import threading
             from health_check import start_health_server
             health_server_thread = threading.Thread(target=start_health_server, daemon=True)
             health_server_thread.start()
-            logger.info("Health check server started for Render")
+            platform = "Render" if os.environ.get('RENDER') else "Railway"
+            logger.info(f"Health check server started for {platform}")
         except Exception as e:
             logger.warning(f"Failed to start health check server: {e}")
     
