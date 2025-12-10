@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     CallbackQuery,
+    ChatMemberUpdated,
 )
 from aiogram.enums import ChatType
 from aiogram.enums import ParseMode
@@ -226,6 +227,32 @@ async def cmd_start(message: Message):
         "Добавь бота в групповой чат, сделай его администратором и нажми /newgame чтобы начать новую игру.\n"
         "Игроки будут присоединяться через кнопку 'Присоединиться'.\n\n"
     )
+
+@dp.chat_member()
+async def on_chat_member_update(update: ChatMemberUpdated):
+    """Обработчик добавления бота в группу"""
+    try:
+        # Получаем информацию о боте
+        bot_info = await bot.get_me()
+        
+        # Проверяем, что это изменение статуса бота
+        if update.new_chat_member.user.id == bot_info.id:
+            # Проверяем, что бот был добавлен (статус изменился на member или administrator)
+            old_status = update.old_chat_member.status if update.old_chat_member else None
+            new_status = update.new_chat_member.status
+            
+            # Если бот был добавлен в группу (не был участником, а теперь стал)
+            if old_status in (None, "left", "kicked") and new_status in ("member", "administrator"):
+                try:
+                    await bot.send_message(
+                        update.chat.id,
+                        "Всем привет! Чтобы начать новую игру запустите команду /newgame"
+                    )
+                    logger.info(f"Приветственное сообщение отправлено в группу {update.chat.id}")
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке приветственного сообщения: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике chat_member: {e}")
 
 @dp.message(Command("newgame"))
 async def cmd_newgame(message: Message):
@@ -653,7 +680,7 @@ async def main():
                 await dp.start_polling(
                     bot,
                     drop_pending_updates=is_first_start,  # Очищаем только при первом запуске
-                    allowed_updates=["message", "callback_query"],
+                    allowed_updates=["message", "callback_query", "chat_member"],
                     close_bot_session=False,  # Важно для перезапуска
                     polling_timeout=30,  # Таймаут для каждого запроса getUpdates
                     request_timeout=30,   # Таймаут для HTTP запросов
